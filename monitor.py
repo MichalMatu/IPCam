@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import threading
 import time
 from collections import deque
+from typing import Any
 
 import cv2
 
@@ -13,26 +16,45 @@ from detection_config import (
     runtime_values,
 )
 from detector import YoloDetector
+from monitor_logic import (
+    choose_detect_interval,
+    count_target_labels,
+    is_tracking_active,
+    trigger_ready,
+    trigger_visible,
+    update_consecutive_hits,
+    visible_boxes,
+)
 from recorder import EvidenceRecorder
 from roi import RuntimeConfigStore, crop_frame, roi_to_pixels
 from source import IpWebcamSource
-from video_utils import draw_detections, draw_roi, format_timestamp, preview_frame, processing_profile
+from video_utils import (
+    draw_detections,
+    draw_roi,
+    format_timestamp,
+    preview_frame,
+    processing_profile,
+)
 
 
 class DogMonitor:
-    def __init__(self, settings):
+    """Own the camera worker thread and expose thread-safe monitor state."""
+
+    def __init__(self, settings: Any) -> None:
         self.settings = settings
-        self.config_store = RuntimeConfigStore(settings.config_path, settings.stream_url, settings)
+        self.config_store = RuntimeConfigStore(
+            settings.config_path, settings.stream_url, settings
+        )
         self.lock = threading.Lock()
         self.thread_lock = threading.Lock()
-        self.thread = None
+        self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.source_changed = threading.Event()
-        self.latest_jpeg = None
+        self.latest_jpeg: bytes | None = None
         self.events = deque(maxlen=50)
         self.status = self._initial_status()
 
-    def _initial_status(self):
+    def _initial_status(self) -> dict[str, Any]:
         roi = self.config_store.get_roi()
         stream_url = self.config_store.get_stream_url()
         detection = self.config_store.get_detection()
@@ -80,21 +102,26 @@ class DogMonitor:
             "open_failures": 0,
         }
 
-    def start(self):
+    def start(self) -> bool:
         with self.thread_lock:
             if self.thread and self.thread.is_alive():
                 return False
-
             self.stop_event.clear()
-            self.thread = threading.Thread(target=self._run, name="dog-monitor", daemon=True)
+            self.thread = threading.Thread(
+                target=self._run, name="dog-monitor", daemon=True
+            )
             self.thread.start()
             return True
 
-    def stop(self, timeout=5):
+    def stop(self, timeout: float = 5) -> bool:
         self.stop_event.set()
         with self.thread_lock:
             thread = self.thread
-            if thread and thread.is_alive() and threading.current_thread() != thread:
+            if (
+                thread
+                and thread.is_alive()
+                and threading.current_thread() != thread
+            ):
                 thread.join(timeout=timeout)
             return not (thread and thread.is_alive())
 
@@ -102,7 +129,7 @@ class DogMonitor:
         with self.lock:
             return dict(self.status), list(self.events), self.latest_jpeg
 
-    def config_snapshot(self):
+    def config_snapshot(self) -> dict[str, Any]:
         detection = self.config_store.get_detection()
         with self.lock:
             return {
@@ -117,7 +144,7 @@ class DogMonitor:
                 "detection": detection,
             }
 
-    def detection_config_snapshot(self):
+    def detection_config_snapshot(self) -> dict[str, Any]:
         detection = self.config_store.get_detection()
         return {
             "config": detection,
@@ -126,20 +153,17 @@ class DogMonitor:
             "model_status": model_status(detection["model_path"]),
         }
 
-    def update_detection_config(self, payload):
+    def update_detection_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.config_store.get_detection()
         candidate = normalize_detection_config(payload, current)
-        status = model_status(candidate["model_path"])
-        # Pozwalamy na nieistniejace pliki, bo Ultralytics automatycznie je pobierze
-        # if not status["exists"]:
-        #     raise ValueError(status["message"])
-
         before, after = self.config_store.set_detection(candidate)
         restart_fields = changed_restart_fields(before, after)
         self._set_detection_status(after)
         restarted = False
         if restart_fields:
-            restarted = self.restart_engine("Zmiana ustawien YOLO: " + ", ".join(restart_fields))
+            restarted = self.restart_engine(
+                "Zmiana ustawien YOLO: " + ", ".join(restart_fields)
+            )
         return {
             "config": after,
             "restart_required": bool(restart_fields),
@@ -148,13 +172,9 @@ class DogMonitor:
             "model_status": model_status(after["model_path"]),
         }
 
-    def restart_engine(self, reason):
+    def restart_engine(self, reason: str) -> bool:
         self._add_event(
-            {
-                "type": "engine",
-                "time": format_timestamp(),
-                "message": reason,
-            }
+            {"type": "engine", "time": format_timestamp(), "message": reason}
         )
         self._set_status(
             engine_state="restarting",
@@ -169,7 +189,6 @@ class DogMonitor:
                 last_error="Nie udalo sie zatrzymac silnika detekcji przed restartem",
             )
             return False
-
         if not self.start():
             self._set_status(
                 engine_state="error",
@@ -184,11 +203,11 @@ class DogMonitor:
         self._set_status(roi=normalized, roi_active=True)
         return normalized
 
-    def clear_roi(self):
+    def clear_roi(self) -> None:
         self.config_store.clear_roi()
         self._set_status(roi=None, roi_active=False, roi_pixels=None)
 
-    def set_stream_url(self, stream_url):
+    def set_stream_url(self, stream_url: str) -> str:
         normalized = self.config_store.set_stream_url(stream_url)
         self.source_changed.set()
         self._set_status(
@@ -202,7 +221,7 @@ class DogMonitor:
         )
         return normalized
 
-    def _set_detection_status(self, detection):
+    def _set_detection_status(self, detection: dict[str, Any]) -> None:
         self._set_status(
             model=detection["model_path"],
             profile=detection["profile"],
@@ -216,38 +235,39 @@ class DogMonitor:
             preview_enabled=detection["preview_enabled"],
         )
 
-    def _set_status(self, **changes):
+    def _set_status(self, **changes: Any) -> None:
         with self.lock:
             self.status.update(changes)
 
-    def _increment_status(self, key):
+    def _increment_status(self, key: str) -> int:
         with self.lock:
             value = int(self.status.get(key) or 0) + 1
             self.status[key] = value
             return value
 
-    def _add_event(self, event):
+    def _add_event(self, event: dict[str, Any]) -> None:
         with self.lock:
             self.events.appendleft(event)
 
-    def _set_preview(self, frame, boxes, preview_width, roi_pixels):
+    def _set_preview(self, frame, boxes, preview_width: int, roi_pixels) -> None:
         preview = preview_frame(frame, boxes, preview_width, roi_pixels)
-        ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+        ok, encoded = cv2.imencode(
+            ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 78]
+        )
         if ok:
             with self.lock:
                 self.latest_jpeg = encoded.tobytes()
 
-    def _refresh_camera_status(self, source):
+    def _refresh_camera_status(self, source: IpWebcamSource) -> None:
         status = source.status()
         if not status:
             return
-
         self._set_status(
             camera_resolution=status.get("video_size"),
             camera_quality=status.get("quality"),
         )
 
-    def _open_source(self, source):
+    def _open_source(self, source: IpWebcamSource) -> bool:
         self._set_status(last_error="Lacze z kamera", stream_state="connecting")
         while not self.stop_event.is_set():
             desired_url = self.config_store.get_stream_url()
@@ -255,33 +275,39 @@ class DogMonitor:
                 source.close()
                 source.stream_url = desired_url
                 self._set_status(stream_url=desired_url)
-
             if source.open():
                 self._refresh_camera_status(source)
                 self._set_status(last_error=None, stream_state="connected")
                 return True
-
             self._increment_status("open_failures")
             self._set_status(
-                last_error=f"Nie udalo sie otworzyc kamery. Ponawiam za {self.settings.reconnect_delay}s.",
+                last_error=(
+                    "Nie udalo sie otworzyc kamery. "
+                    f"Ponawiam za {self.settings.reconnect_delay}s."
+                ),
                 stream_state="reconnecting",
             )
             self.stop_event.wait(self.settings.reconnect_delay)
         return False
 
-    def _run(self):
-        source = IpWebcamSource(self.config_store.get_stream_url(), self.settings.ip_webcam_timeout)
+    def _run(self) -> None:
+        source = IpWebcamSource(
+            self.config_store.get_stream_url(), self.settings.ip_webcam_timeout
+        )
         detection = self.config_store.get_detection()
         recorder = EvidenceRecorder(self.settings.output_dir, 20)
         self._set_detection_status(detection)
-        self._set_status(running=True, engine_state="starting", engine_restarting=False, last_error=None)
+        self._set_status(
+            running=True,
+            engine_state="starting",
+            engine_restarting=False,
+            last_error=None,
+        )
 
         try:
-            status = model_status(detection["model_path"])
-            # Pozwalamy na nieistniejace pliki, bo YOLO pobiera je automatycznie
-            # if not status["exists"]:
-            #     raise RuntimeError(status["message"])
-            detector = YoloDetector(detection["model_path"], detection["yolo_device"])
+            detector = YoloDetector(
+                detection["model_path"], detection["yolo_device"]
+            )
             self._set_status(yolo_device=detector.device)
             if not self._open_source(source):
                 self._set_status(
@@ -301,11 +327,11 @@ class DogMonitor:
             )
             return
 
-        last_target_at = 0
-        last_positive_at = 0
-        last_status_at = 0
-        last_preview_at = 0
-        next_detect_at = 0
+        last_target_at = 0.0
+        last_positive_at = 0.0
+        last_status_at = 0.0
+        last_preview_at = 0.0
+        next_detect_at = 0.0
         frames_since_fps = 0
         fps_window_started_at = time.time()
         actual_fps = 0.0
@@ -319,6 +345,7 @@ class DogMonitor:
                 runtime = runtime_values(detection)
                 self._set_detection_status(detection)
                 desired_url = self.config_store.get_stream_url()
+
                 if self.source_changed.is_set() or desired_url != source.stream_url:
                     self.source_changed.clear()
                     source.close()
@@ -332,9 +359,11 @@ class DogMonitor:
                                 "message": "Zakonczono nagrywanie przed zmiana kamery",
                             }
                         )
-                    source = IpWebcamSource(desired_url, self.settings.ip_webcam_timeout)
-                    last_target_at = 0
-                    last_positive_at = 0
+                    source = IpWebcamSource(
+                        desired_url, self.settings.ip_webcam_timeout
+                    )
+                    last_target_at = 0.0
+                    last_positive_at = 0.0
                     last_boxes = []
                     consecutive_hits = {"dog": 0, "person": 0}
                     actual_fps = 0.0
@@ -368,7 +397,10 @@ class DogMonitor:
                     source.close()
                     if self.stop_event.wait(self.settings.reconnect_delay):
                         break
-                    source = IpWebcamSource(self.config_store.get_stream_url(), self.settings.ip_webcam_timeout)
+                    source = IpWebcamSource(
+                        self.config_store.get_stream_url(),
+                        self.settings.ip_webcam_timeout,
+                    )
                     self._set_status(stream_url=source.stream_url)
                     if not self._open_source(source):
                         break
@@ -393,13 +425,17 @@ class DogMonitor:
                     runtime["evidence_fps"],
                 )
 
-                active_tracking = bool(last_boxes) and now - last_positive_at <= detection["active_track_seconds"]
-                detect_interval = (
-                    detection["active_detect_seconds"]
-                    if active_tracking
-                    else detection["idle_detect_seconds"]
+                active_tracking = is_tracking_active(
+                    last_boxes,
+                    now=now,
+                    last_positive_at=last_positive_at,
+                    active_track_seconds=detection["active_track_seconds"],
+                )
+                detect_interval = choose_detect_interval(
+                    active_tracking=active_tracking, detection=detection
                 )
                 should_detect = now >= next_detect_at
+
                 if should_detect:
                     next_detect_at = now + detect_interval
                     try:
@@ -419,7 +455,10 @@ class DogMonitor:
                     except Exception as exc:
                         last_boxes = []
                         consecutive_hits = {"dog": 0, "person": 0}
-                        self._set_status(last_error=f"Blad YOLO: {exc}", yolo_device=detector.device)
+                        self._set_status(
+                            last_error=f"Blad YOLO: {exc}",
+                            yolo_device=detector.device,
+                        )
                         next_detect_at = now + detection["idle_detect_seconds"]
                         continue
                     if last_boxes:
@@ -428,20 +467,30 @@ class DogMonitor:
                     else:
                         consecutive_hits = {"dog": 0, "person": 0}
 
-                target_visible = bool(last_boxes) and now - last_positive_at <= detection["active_track_seconds"]
-                visible_boxes = last_boxes if target_visible else []
-                dog_count = sum(1 for box in visible_boxes if box[4] == "dog")
-                person_count = sum(1 for box in visible_boxes if box[4] == "person")
-                trigger_visible = (
-                    ("dog" in runtime["trigger_labels"] and dog_count > 0)
-                    or ("person" in runtime["trigger_labels"] and person_count > 0)
+                visible = visible_boxes(
+                    last_boxes,
+                    now=now,
+                    last_positive_at=last_positive_at,
+                    active_track_seconds=detection["active_track_seconds"],
+                )
+                target_visible = bool(visible)
+                dog_count, person_count = count_target_labels(visible)
+                trigger_is_visible = trigger_visible(
+                    trigger_labels=runtime["trigger_labels"],
+                    dog_count=dog_count,
+                    person_count=person_count,
                 )
 
                 if not detection["preview_enabled"]:
                     with self.lock:
                         self.latest_jpeg = None
                 elif now - last_preview_at >= self.settings.preview_seconds:
-                    self._set_preview(frame, visible_boxes, frame_profile["preview_width"], roi_pixels)
+                    self._set_preview(
+                        frame,
+                        visible,
+                        frame_profile["preview_width"],
+                        roi_pixels,
+                    )
                     last_preview_at = now
 
                 frames_since_fps += 1
@@ -456,7 +505,7 @@ class DogMonitor:
 
                 self._set_status(
                     target_visible=target_visible,
-                    trigger_visible=trigger_visible,
+                    trigger_visible=trigger_is_visible,
                     dog_count=dog_count,
                     person_count=person_count,
                     last_frame_at=now,
@@ -468,36 +517,46 @@ class DogMonitor:
                     actual_fps=round(actual_fps, 2) if actual_fps else None,
                     roi=roi,
                     roi_active=bool(roi),
-                    roi_pixels=f"{roi_pixels[2] - roi_pixels[0]}x{roi_pixels[3] - roi_pixels[1]}"
-                    if roi_pixels
-                    else None,
+                    roi_pixels=(
+                        f"{roi_pixels[2] - roi_pixels[0]}x"
+                        f"{roi_pixels[3] - roi_pixels[1]}"
+                        if roi_pixels
+                        else None
+                    ),
                     stream_state="connected",
                 )
 
-                if should_detect:
-                    consecutive_hits["dog"] = consecutive_hits["dog"] + 1 if dog_count else 0
-                    consecutive_hits["person"] = consecutive_hits["person"] + 1 if person_count else 0
-
-                dog_ready = (
-                    "dog" in runtime["trigger_labels"]
-                    and consecutive_hits["dog"] >= detection["min_hits_dog"]
+                consecutive_hits = update_consecutive_hits(
+                    consecutive_hits,
+                    should_detect=should_detect,
+                    dog_count=dog_count,
+                    person_count=person_count,
                 )
-                person_ready = (
-                    "person" in runtime["trigger_labels"]
-                    and consecutive_hits["person"] >= detection["min_hits_person"]
+                trigger_is_ready = trigger_ready(
+                    trigger_is_visible=trigger_is_visible,
+                    trigger_labels=runtime["trigger_labels"],
+                    hits=consecutive_hits,
+                    min_hits_dog=detection["min_hits_dog"],
+                    min_hits_person=detection["min_hits_person"],
                 )
-                trigger_ready = trigger_visible and (dog_ready or person_ready)
 
-                if should_detect and trigger_ready:
+                if should_detect and trigger_is_ready:
                     last_target_at = now
                     self._set_status(last_target_at=now)
-
                     if not recorder.recording:
                         timestamp = format_timestamp()
-                        writer_fps = actual_fps if actual_fps >= 1 else frame_profile["evidence_fps"]
-                        video_path = recorder.start(timestamp, writer_fps, (width, height))
+                        writer_fps = (
+                            actual_fps
+                            if actual_fps >= 1
+                            else frame_profile["evidence_fps"]
+                        )
+                        video_path = recorder.start(
+                            timestamp, writer_fps, (width, height)
+                        )
                         recorder.mark_started(now)
-                        self._set_status(recording=True, current_video=video_path)
+                        self._set_status(
+                            recording=True, current_video=video_path
+                        )
                         self._add_event(
                             {
                                 "type": "start",
@@ -506,11 +565,10 @@ class DogMonitor:
                                 "message": "Rozpoczeto nagrywanie",
                             }
                         )
-
                     if recorder.recording:
                         full_frame = frame.copy()
                         draw_roi(full_frame, roi_pixels, scale=1.0)
-                        draw_detections(full_frame, visible_boxes, scale=1.0)
+                        draw_detections(full_frame, visible, scale=1.0)
                         image_path = recorder.save_image(full_frame)
                         if image_path:
                             self._add_event(
@@ -528,7 +586,10 @@ class DogMonitor:
                     recorder.write(frame)
                     elapsed = now - recorder.started_at
                     missing_for = now - last_target_at
-                    if missing_for >= detection["post_roll_seconds"] or elapsed >= self.settings.max_event_seconds:
+                    if (
+                        missing_for >= detection["post_roll_seconds"]
+                        or elapsed >= self.settings.max_event_seconds
+                    ):
                         video_path = recorder.stop()
                         self._add_event(
                             {
